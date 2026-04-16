@@ -20,6 +20,11 @@ const matchSchema = new mongoose.Schema({
   // ── Smart Match Data ──────────────────────────────────────────────────────
   matchScore: { type: Number, default: 0 },
   matchTag:   { type: String, default: '' },
+  semanticDetails: {
+    type: mongoose.Schema.Types.Mixed,
+    default: {},
+    description: 'Detailed semantic matching information',
+  },
 
   // ── Scheduling ────────────────────────────────────────────────────────────
   schedule: {

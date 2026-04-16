@@ -17,7 +17,9 @@ import { useAuth } from './AuthContext';
 
 const SocketContext = createContext(null);
 
-const SOCKET_URL = import.meta.env.VITE_SERVER_URL || 'http://localhost:5050';
+// Empty string = connect to same origin; Vite proxy forwards /socket.io → port 6060
+// Override with VITE_SERVER_URL for production deployments
+const SOCKET_URL = import.meta.env.VITE_SERVER_URL || '';
 
 export const SocketProvider = ({ children }) => {
   const { user } = useAuth();

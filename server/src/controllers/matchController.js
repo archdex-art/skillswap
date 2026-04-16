@@ -1,9 +1,11 @@
 const Match = require('../models/Match');
 const User = require('../models/User');
 const { analyzeIntent, matchSkills } = require('../services/nlpService');
+const { computeSimilarity } = require('../services/embeddingService');
+const logger = require('../utils/logger');
 
 // ── Cooldown Config ───────────────────────────────────────────────────────────
-const COOLDOWN_MAX    = 5;    // max requests per window
+const COOLDOWN_MAX = 5;    // max requests per window
 const COOLDOWN_WINDOW = 30;   // minutes
 
 // ── Shared populate fields ────────────────────────────────────────────────────
@@ -40,7 +42,7 @@ const requestMatch = async (req, res) => {
     const requester = await User.findById(req.user._id);
     const cd = requester.requestCooldown;
     const windowStart = cd.windowStart ? new Date(cd.windowStart) : null;
-    const windowAge   = windowStart ? (now - windowStart) / 60000 : Infinity; // minutes
+    const windowAge = windowStart ? (now - windowStart) / 60000 : Infinity; // minutes
 
     if (windowStart && windowAge < COOLDOWN_WINDOW) {
       if (cd.count >= COOLDOWN_MAX) {
@@ -52,41 +54,78 @@ const requestMatch = async (req, res) => {
       requester.requestCooldown.count += 1;
     } else {
       // Reset window
-      requester.requestCooldown.count       = 1;
+      requester.requestCooldown.count = 1;
       requester.requestCooldown.windowStart = now;
     }
     await requester.save();
 
     // ── Duplicate / Active Request Check ───────────────────────────────────
+    // Check for ANY existing match between these two users (any status)
     const existingMatch = await Match.findOne({
       $or: [
         { requester: req.user._id, recipient: recipientId },
         { requester: recipientId, recipient: req.user._id },
       ],
-      status: { $in: ['pending', 'accepted'] },
-      expiresAt: { $gt: now },
     });
 
     if (existingMatch) {
-      return res.status(400).json({
-        message: existingMatch.status === 'accepted'
-          ? 'You are already connected with this user.'
-          : 'A pending request already exists with this user.',
-      });
+      if (existingMatch.status === 'accepted') {
+        return res.status(400).json({ message: 'You are already connected with this user.' });
+      }
+      if (existingMatch.status === 'pending' && existingMatch.expiresAt > now) {
+        return res.status(400).json({ message: 'A pending request already exists with this user.' });
+      }
+      // Expired or rejected — delete stale record so we can create a fresh one
+      await Match.deleteOne({ _id: existingMatch._id });
     }
 
     // ── NLP: Intent Detection ───────────────────────────────────────────────
     const intentData = analyzeIntent(message || '');
 
-    // ── Calculate Match Score and Tag ───────────────────────────────────────
+    // ── Calculate Semantic Match Score ──────────────────────────────────────
     const recipient = await User.findById(recipientId);
-    const iWantTheyOffer = matchSkills(requester.skillsWanted, recipient.skillsOffered || []);
-    const theyWantIOffer = matchSkills(requester.skillsOffered, recipient.skillsWanted || []);
-    const skillOverlapScore = (iWantTheyOffer.score + theyWantIOffer.score) / 2;
-    const trustNorm = (recipient.trustScore || 50) / 100;
-    
-    const matchScore = Math.round((skillOverlapScore * 75) + (trustNorm * 25));
-    let matchTag;
+
+    let matchScore = 50; // Default fallback
+    let matchTag = 'Average Match';
+    let semanticDetails = {};
+
+    try {
+      // Use semantic similarity if NLP service is available
+      const similarity = await computeSimilarity(
+        requester.skillsWanted || [],
+        requester.skillsOffered || [],
+        recipient.skillsOffered || [],
+        recipient.skillsWanted || []
+      );
+
+      const semanticScore = similarity.final_score * 100;
+      const trustNorm = (recipient.trustScore || 50) / 100;
+
+      matchScore = Math.round((semanticScore * 0.75) + (trustNorm * 25));
+      semanticDetails = {
+        semanticScore: Math.round(semanticScore),
+        userWantsMatch: Math.round(similarity.user_wants_target_offers * 100),
+        targetWantsMatch: Math.round(similarity.target_wants_user_offers * 100),
+        trustScore: Math.round(trustNorm * 100),
+      };
+
+      logger.info(`✅ Semantic match score: ${matchScore} for ${requester._id} → ${recipientId}`);
+    } catch (error) {
+      // Fallback to keyword-based matching if NLP service fails
+      logger.warn(`⚠️ NLP service unavailable, falling back to keyword matching: ${error.message}`);
+      const iWantTheyOffer = matchSkills(requester.skillsWanted, recipient.skillsOffered || []);
+      const theyWantIOffer = matchSkills(requester.skillsOffered, recipient.skillsWanted || []);
+      const skillOverlapScore = (iWantTheyOffer.score + theyWantIOffer.score) / 2;
+      const trustNorm = (recipient.trustScore || 50) / 100;
+
+      matchScore = Math.round((skillOverlapScore * 75) + (trustNorm * 25));
+      semanticDetails = {
+        method: 'keyword_fallback',
+        skillOverlap: Math.round(skillOverlapScore * 100),
+      };
+    }
+
+    // Determine match tag based on score
     if (matchScore >= 85) matchTag = 'Perfect Match';
     else if (matchScore >= 70) matchTag = 'Great Match';
     else if (matchScore >= 50) matchTag = 'Good Match';
@@ -94,12 +133,13 @@ const requestMatch = async (req, res) => {
 
     // ── Create Match ────────────────────────────────────────────────────────
     const match = await Match.create({
-      requester:  req.user._id,
-      recipient:  recipientId,
-      message:    message || '',
+      requester: req.user._id,
+      recipient: recipientId,
+      message: message || '',
       intentData,
       matchScore,
       matchTag,
+      semanticDetails,
     });
 
     const populated = await Match.findById(match._id)
@@ -108,15 +148,21 @@ const requestMatch = async (req, res) => {
 
     // ── Real-Time Notification → Recipient ─────────────────────────────────
     emitNotification(req.app.get('io'), recipientId, {
-      type:    'new_request',
-      title:   'New Skill Swap Request',
-      body:    `${req.user.name} wants to swap skills with you!`,
+      type: 'new_request',
+      title: 'New Skill Swap Request',
+      body: `${req.user.name} wants to swap skills with you!`,
       matchId: match._id.toString(),
       urgency: intentData.urgency,
     });
 
     res.status(201).json(populated);
   } catch (error) {
+    // E11000: duplicate key — a match document already exists for this pair
+    if (error.code === 11000) {
+      return res.status(400).json({
+        message: 'You have already sent a request to this user.',
+      });
+    }
     res.status(500).json({ message: error.message });
   }
 };
@@ -154,9 +200,9 @@ const respondToMatch = async (req, res) => {
     // ── Trust Score Updates ─────────────────────────────────────────────────
     if (status === 'accepted') {
       const recipientUser = await User.findById(req.user._id);
-      recipientUser.acceptedCount    += 1;
-      recipientUser.receivedCount    += 1;
-      recipientUser.acceptanceRate    = recipientUser.acceptedCount / recipientUser.receivedCount;
+      recipientUser.acceptedCount += 1;
+      recipientUser.receivedCount += 1;
+      recipientUser.acceptanceRate = recipientUser.acceptedCount / recipientUser.receivedCount;
       recipientUser.recalculateTrustScore();
       await recipientUser.save();
     } else if (status === 'rejected') {
@@ -176,19 +222,19 @@ const respondToMatch = async (req, res) => {
     // ── Real-Time Notification → Requester ─────────────────────────────────
     if (status === 'accepted') {
       emitNotification(io, match.requester.toString(), {
-        type:    'request_accepted',
-        title:   'Request Accepted! 🎉',
-        body:    `${req.user.name} accepted your skill swap request!`,
+        type: 'request_accepted',
+        title: 'Request Accepted! 🎉',
+        body: `${req.user.name} accepted your skill swap request!`,
         matchId: match._id.toString(),
       });
       // Auto-open chat for both parties
       io?.to(`user:${match.requester.toString()}`).emit('open_chat', { matchId: match._id.toString() });
-      io?.to(`user:${req.user._id.toString()}`).emit('open_chat',   { matchId: match._id.toString() });
+      io?.to(`user:${req.user._id.toString()}`).emit('open_chat', { matchId: match._id.toString() });
     } else {
       emitNotification(io, match.requester.toString(), {
-        type:    'request_rejected',
-        title:   'Request Declined',
-        body:    `${req.user.name} declined your skill swap request.`,
+        type: 'request_rejected',
+        title: 'Request Declined',
+        body: `${req.user.name} declined your skill swap request.`,
         matchId: match._id.toString(),
       });
     }
@@ -208,14 +254,22 @@ const getMatches = async (req, res) => {
   try {
     const now = new Date();
     const matches = await Match.find({
-      $or: [
-        { requester: req.user._id },
-        { recipient: req.user._id },
-      ],
-      $or: [
-        { status: { $in: ['accepted', 'completed'] } },               // always visible
-        { status: 'pending', expiresAt: { $gt: now } },               // only non-expired pending
-        { status: 'rejected' },                                        // show rejected in sent tab
+      // Must involve this user
+      $and: [
+        {
+          $or: [
+            { requester: req.user._id },
+            { recipient: req.user._id },
+          ],
+        },
+        {
+          // Show active/completed always; pending if not expired; rejected for history
+          $or: [
+            { status: { $in: ['accepted', 'completed'] } },
+            { status: 'pending', expiresAt: { $gt: now } },
+            { status: 'rejected' },
+          ],
+        },
       ],
     })
       .populate('requester', `${POPULATE_FIELDS} bio location`)
@@ -260,9 +314,9 @@ const scheduleSession = async (req, res) => {
       : match.requester.toString();
 
     emitNotification(io, otherId, {
-      type:    'session_scheduled',
-      title:   'Session Scheduled 📅',
-      body:    `${req.user.name} scheduled your session for ${date} at ${time}.`,
+      type: 'session_scheduled',
+      title: 'Session Scheduled 📅',
+      body: `${req.user.name} scheduled your session for ${date} at ${time}.`,
       matchId: match._id.toString(),
     });
 
@@ -289,7 +343,7 @@ const completeMatch = async (req, res) => {
       .includes(req.user._id.toString());
     if (!isParty) return res.status(403).json({ message: 'Not authorized' });
 
-    match.status      = 'completed';
+    match.status = 'completed';
     match.completedAt = new Date();
     await match.save();
 

@@ -19,6 +19,23 @@ const userSchema = new mongoose.Schema({
   skillsWanted:          [{ type: String }],             // NLP-normalized
   availability:          { type: String, default: 'Flexible' },
 
+  // ── Semantic Embeddings (for NLP matching) ──────────────────────────────
+  embeddingOffered: {
+    type: [Number],                           // 384-dim vectors from all-MiniLM-L6-v2
+    default: [],
+    description: 'Semantic embedding for skills offered'
+  },
+  embeddingWanted: {
+    type: [Number],
+    default: [],
+    description: 'Semantic embedding for skills wanted'
+  },
+  embeddingUpdatedAt: {
+    type: Date,
+    default: null,
+    description: 'Last time embeddings were computed'
+  },
+
   // ── Trust Score Components ───────────────────────────────────────────────
   trustScore:      { type: Number, default: 50 },  // computed, stored for fast queries
   acceptedCount:   { type: Number, default: 0 },   // times this user accepted a request

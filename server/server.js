@@ -12,33 +12,36 @@ connectDB();
 const app = express();
 
 app.use(cors({
-  origin: process.env.CLIENT_URL || 'http://localhost:5173',
+  // Accept any localhost port (handles Vite fallback from 5173 → 5174, etc.)
+  origin: /^http:\/\/localhost(:\d+)?$/,
   methods: ['GET', 'POST', 'PUT', 'DELETE'],
   credentials: true,
 }));
 app.use(express.json());
 
 // ── Routes ────────────────────────────────────────────────────────────────────
-const authRoutes   = require('./src/routes/authRoutes');
-const userRoutes   = require('./src/routes/userRoutes');
-const matchRoutes  = require('./src/routes/matchRoutes');
-const reviewRoutes  = require('./src/routes/reviewRoutes');
-const messageRoutes = require('./src/routes/messageRoutes');
-const nlpRoutes     = require('./src/routes/nlpRoutes');
+const authRoutes           = require('./src/routes/authRoutes');
+const userRoutes           = require('./src/routes/userRoutes');
+const matchRoutes          = require('./src/routes/matchRoutes');
+const reviewRoutes         = require('./src/routes/reviewRoutes');
+const messageRoutes        = require('./src/routes/messageRoutes');
+const nlpRoutes            = require('./src/routes/nlpRoutes');
+const recommendationRoutes = require('./src/routes/recommendationRoutes');
 
-app.use('/api/auth',     authRoutes);
-app.use('/api/users',    userRoutes);
-app.use('/api/matches',  matchRoutes);
-app.use('/api/reviews',  reviewRoutes);
-app.use('/api/messages', messageRoutes);
-app.use('/api/nlp',      nlpRoutes);
+app.use('/api/auth',            authRoutes);
+app.use('/api/users',           userRoutes);
+app.use('/api/matches',         matchRoutes);
+app.use('/api/reviews',         reviewRoutes);
+app.use('/api/messages',        messageRoutes);
+app.use('/api/nlp',             nlpRoutes);
+app.use('/api/recommendations', recommendationRoutes);
 
 // ── Socket.io ─────────────────────────────────────────────────────────────────
 const server = http.createServer(app);
 
 const io = new Server(server, {
   cors: {
-    origin: process.env.CLIENT_URL || 'http://localhost:5173',
+    origin: /^http:\/\/localhost(:\d+)?$/,
     methods: ['GET', 'POST'],
     credentials: true,
   },
@@ -50,7 +53,15 @@ app.set('io', io);
 socketHandler(io);
 
 // ── Start ─────────────────────────────────────────────────────────────────────
-const PORT = process.env.PORT || 5000;
+const PORT = process.env.PORT || 6060;
+
+server.on('error', (err) => {
+  if (err.code === 'EADDRINUSE') {
+    console.error(`❌ Port ${PORT} is already in use. Set a different PORT in server/.env or stop the process using it.`);
+    process.exit(1);
+  }
+  throw err;
+});
 
 server.listen(PORT, () => {
   console.log(`✅ Server running in ${process.env.NODE_ENV || 'development'} mode on port ${PORT}`);
