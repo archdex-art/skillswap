@@ -50,7 +50,25 @@ export default function Chat() {
     socket.emit('join_room', matchId);
 
     socket.on('receive_message', (msg) => {
-      setMessages(prev => [...prev, msg]);
+      setMessages(prev => {
+        // Replace any matching optimistic placeholder (same sender + text + close timestamp)
+        // or deduplicate if the server echo already arrived.
+        const isDuplicate = prev.some(m => m._id === msg._id);
+        if (isDuplicate) return prev;
+
+        // Replace optimistic entry from the same user with the persisted one
+        const optimisticIndex = prev.findIndex(
+          m => m._id.startsWith('optimistic-') &&
+               (m.sender?._id || m.sender) === (msg.sender?._id || msg.sender) &&
+               m.text === msg.text
+        );
+        if (optimisticIndex !== -1) {
+          const updated = [...prev];
+          updated[optimisticIndex] = msg;
+          return updated;
+        }
+        return [...prev, msg];
+      });
     });
 
     socket.on('user_typing', ({ name }) => {
@@ -80,8 +98,21 @@ export default function Chat() {
   const handleSend = (e) => {
     e.preventDefault();
     if (!text.trim() || !socket) return;
-    socket.emit('send_message', { matchId, sender: user?._id, text: text.trim() });
+
+    const msgText = text.trim();
     setText('');
+
+    // Optimistic update — show message instantly for the sender
+    const optimistic = {
+      _id: `optimistic-${Date.now()}`,
+      matchId,
+      sender: { _id: user?._id, name: user?.name },
+      text: msgText,
+      createdAt: new Date().toISOString(),
+    };
+    setMessages(prev => [...prev, optimistic]);
+
+    socket.emit('send_message', { matchId, sender: user?._id, text: msgText });
   };
 
   // Determine partner

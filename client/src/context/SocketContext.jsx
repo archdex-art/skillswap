@@ -3,7 +3,11 @@
  *
  * Provides a global socket.io-client connection + real-time notification state.
  * Wraps the entire authenticated app so any component can access:
- *   { socket, notifications, unreadCount, clearNotification, clearAll }
+ *   { socket, notifications, unreadCount, clearNotification, markAllRead, clearAll }
+ *
+ * FIX: socket is stored in state (not just a ref) so consumers re-render
+ * when the connection is established, preventing the "socket is null" bug
+ * that caused chat messages to never be sent.
  */
 
 import { createContext, useContext, useEffect, useState, useRef, useCallback } from 'react';
@@ -19,21 +23,33 @@ export const SocketProvider = ({ children }) => {
   const { user } = useAuth();
   const navigate  = useNavigate();
   const socketRef = useRef(null);
+  // ↓ State-tracked socket instance so consumers re-render when it connects
+  const [socket, setSocket] = useState(null);
   const [notifications, setNotifications] = useState([]);
 
   // ── Connect / disconnect based on auth ─────────────────────────────────────
   useEffect(() => {
     if (!user?._id) return;
 
-    const socket = io(SOCKET_URL, { transports: ['websocket'], reconnectionAttempts: 5 });
-    socketRef.current = socket;
+    const s = io(SOCKET_URL, {
+      transports: ['websocket'],
+      reconnectionAttempts: 5,
+    });
+    socketRef.current = s;
 
-    socket.on('connect', () => {
-      socket.emit('register_user', user._id);
+    s.on('connect', () => {
+      console.log('[Socket] Connected:', s.id);
+      s.emit('register_user', user._id);
+      // Expose via state AFTER connection so consumers get a live socket
+      setSocket(s);
+    });
+
+    s.on('connect_error', (err) => {
+      console.error('[Socket] Connection error:', err.message);
     });
 
     // ── Incoming notifications ────────────────────────────────────────────
-    socket.on('notification', (payload) => {
+    s.on('notification', (payload) => {
       setNotifications(prev => [
         { ...payload, id: Date.now(), read: false, timestamp: new Date().toISOString() },
         ...prev,
@@ -41,13 +57,14 @@ export const SocketProvider = ({ children }) => {
     });
 
     // ── Auto navigate to chat when request accepted ───────────────────────
-    socket.on('open_chat', ({ matchId }) => {
+    s.on('open_chat', ({ matchId }) => {
       navigate(`/chat/${matchId}`);
     });
 
     return () => {
-      socket.disconnect();
+      s.disconnect();
       socketRef.current = null;
+      setSocket(null);
     };
   }, [user?._id, navigate]);
 
@@ -66,7 +83,7 @@ export const SocketProvider = ({ children }) => {
   return (
     <SocketContext.Provider
       value={{
-        socket: socketRef.current,
+        socket,          // live Socket.io instance (null until connected)
         notifications,
         unreadCount,
         clearNotification,
